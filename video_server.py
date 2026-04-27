@@ -3,9 +3,12 @@ import asyncio
 import httpx
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
+from typing import Any
 
-app = FastAPI(title="ViralIQ Video Server")
+app = FastAPI(title="ViralIQ Agency Server")
 
 app.add_middleware(
     CORSMiddleware,
@@ -14,9 +17,11 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-RUNWAY_API_KEY = os.environ.get("RUNWAY_API_KEY", "")
-RUNWAY_BASE    = "https://api.dev.runwayml.com/v1"
-RUNWAY_VERSION = "2024-11-06"
+RUNWAY_API_KEY   = os.environ.get("RUNWAY_API_KEY", "")
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+RUNWAY_BASE      = "https://api.dev.runwayml.com/v1"
+RUNWAY_VERSION   = "2024-11-06"
+ANTHROPIC_BASE   = "https://api.anthropic.com/v1"
 
 def runway_headers():
     return {
@@ -25,26 +30,70 @@ def runway_headers():
         "X-Runway-Version": RUNWAY_VERSION,
     }
 
+def anthropic_headers():
+    return {
+        "x-api-key": ANTHROPIC_API_KEY,
+        "anthropic-version": "2023-06-01",
+        "content-type": "application/json",
+    }
+
 # ── Models ────────────────────────────────────────────────────────────────────
 
 class VideoRequest(BaseModel):
     prompt: str
-    duration: int = 5          # 5 or 10 seconds
-    ratio: str = "768:1280"    # 768:1280 = vertical (Instagram Reels)
-    model: str = "gen3a_turbo" # gen3a_turbo = faster, gen3a = higher quality
+    duration: int = 5
+    ratio: str = "768:1280"
+    model: str = "gen3a_turbo"
 
 class TaskStatusResponse(BaseModel):
     taskId: str
-    status: str                # PENDING | RUNNING | SUCCEEDED | FAILED
+    status: str
     videoUrl: str | None = None
-    progress: int = 0          # 0-100
+    progress: int = 0
+
+class ChatRequest(BaseModel):
+    system: str
+    messages: list[dict[str, Any]]
+    max_tokens: int = 700
+    tools: list[dict[str, Any]] | None = None
 
 # ── Routes ────────────────────────────────────────────────────────────────────
 
 @app.get("/health")
 def health():
-    has_key = bool(RUNWAY_API_KEY)
-    return {"status": "ok", "runway_key_set": has_key}
+    return {
+        "status": "ok",
+        "runway_key_set": bool(RUNWAY_API_KEY),
+        "anthropic_key_set": bool(ANTHROPIC_API_KEY),
+    }
+
+
+@app.post("/chat")
+async def chat(req: ChatRequest):
+    """Proxy Claude API calls — keeps ANTHROPIC_API_KEY secure on the server."""
+    if not ANTHROPIC_API_KEY:
+        raise HTTPException(500, "ANTHROPIC_API_KEY not set in Railway Variables")
+
+    payload: dict[str, Any] = {
+        "model": "claude-sonnet-4-20250514",
+        "max_tokens": req.max_tokens,
+        "system": req.system,
+        "messages": req.messages,
+    }
+    if req.tools:
+        payload["tools"] = req.tools
+
+    async with httpx.AsyncClient(timeout=120) as client:
+        res = await client.post(
+            f"{ANTHROPIC_BASE}/messages",
+            headers=anthropic_headers(),
+            json=payload,
+        )
+
+    if res.status_code != 200:
+        raise HTTPException(res.status_code, f"Anthropic error: {res.text}")
+
+    return res.json()
 
 
 @app.post("/generate-video")
